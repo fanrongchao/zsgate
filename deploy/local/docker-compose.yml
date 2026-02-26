@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  control-plane:
+    image: golang:1.22-alpine
+    working_dir: /app
+    volumes:
+      - ../../:/app
+    command: ["sh", "-lc", "GOCACHE=/tmp/go-build go run ./control-plane/cmd/server"]
+    environment:
+      CONTROL_PLANE_ADDR: ":8081"
+    ports:
+      - "8081:8081"
+
+  data-plane:
+    image: golang:1.22-alpine
+    working_dir: /app
+    volumes:
+      - ../../:/app
+    command: ["sh", "-lc", "GOCACHE=/tmp/go-build CONTROL_PLANE_URL=http://control-plane:8081 go run ./data-plane/cmd/server"]
+    environment:
+      DATA_PLANE_ADDR: ":8080"
+      CONTROL_PLANE_URL: "http://control-plane:8081"
+    depends_on:
+      - control-plane
+    ports:
+      - "8080:8080"
