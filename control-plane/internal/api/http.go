@@ -1,10 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,11 +15,15 @@ import (
 )
 
 type Server struct {
-	store *store.Store
+	store      *store.Store
+	httpClient *http.Client
 }
 
 func NewServer(st *store.Store) *Server {
-	return &Server{store: st}
+	return &Server{
+		store:      st,
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -34,6 +40,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/costs/by-user", s.handleCostsByUser)
 	mux.HandleFunc("/admin/usage/by-user", s.handleUsageByUser)
 	mux.HandleFunc("/admin/usage/by-scenario", s.handleUsageByScenario)
+	mux.HandleFunc("/admin/alerts/rules", s.handleAlertRules)
+	mux.HandleFunc("/admin/alerts/events", s.handleAlertEvents)
+	mux.HandleFunc("/admin/alerts/evaluate", s.handleAlertEvaluate)
 	mux.HandleFunc("/admin/realtime/active-users", s.handleRealtimeActiveUsers)
 	mux.HandleFunc("/admin/realtime/active-tasks", s.handleRealtimeActiveTasks)
 	mux.HandleFunc("/admin/realtime/stream", s.handleRealtimeStream)
@@ -194,6 +203,7 @@ func (s *Server) handleUsageEvent(w http.ResponseWriter, r *http.Request) {
 		e.Timestamp = time.Now().UTC()
 	}
 	s.store.AddUsage(e)
+	s.notifyTriggers(s.store.EvaluateAlerts(time.Now().UTC()))
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "ok"})
 }
 
@@ -389,6 +399,50 @@ func (s *Server) handleUsageByScenario(w http.ResponseWriter, r *http.Request) {
 		out = append(out, a.scenarioUsageSummary)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleAlertRules(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.ListAlertRules())
+	case http.MethodPost:
+		var rule store.AlertRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if rule.ID == "" || rule.Name == "" || rule.Metric == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("id, name, metric are required"))
+			return
+		}
+		writeJSON(w, http.StatusCreated, s.store.UpsertAlertRule(rule))
+	default:
+		methodNotAllowed(w)
+	}
+}
+
+func (s *Server) handleAlertEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			limit = parsed
+		}
+	}
+	writeJSON(w, http.StatusOK, s.store.ListAlertEvents(limit))
+}
+
+func (s *Server) handleAlertEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	triggers := s.store.EvaluateAlerts(time.Now().UTC())
+	s.notifyTriggers(triggers)
+	writeJSON(w, http.StatusOK, map[string]any{"triggered": len(triggers), "events": triggers})
 }
 
 type activeUser struct {
@@ -618,6 +672,28 @@ func (s *Server) handleRealtimeDialogStream(w http.ResponseWriter, r *http.Reque
 		case <-ticker.C:
 			sendBatch()
 		}
+	}
+}
+
+func (s *Server) notifyTriggers(triggers []store.AlertTrigger) {
+	for _, trigger := range triggers {
+		if trigger.WebhookURL == "" {
+			continue
+		}
+		payload, err := json.Marshal(trigger.Event)
+		if err != nil {
+			continue
+		}
+		req, err := http.NewRequest(http.MethodPost, trigger.WebhookURL, bytes.NewReader(payload))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			continue
+		}
+		_ = resp.Body.Close()
 	}
 }
 

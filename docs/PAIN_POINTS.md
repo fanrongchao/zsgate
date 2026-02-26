@@ -39,5 +39,5 @@ Pain:
 - Teams need timely alerts for abnormal cost/error/latency spikes.
 
 Mapped capabilities:
-- OSS: threshold alert basics and webhook integrations (next phase)
+- OSS: threshold alerts (`error_rate`, `latency_p95`, `cost_spike`) with optional webhook
 - Enterprise: advanced alert routing, suppression, escalation, SLO burn-rate

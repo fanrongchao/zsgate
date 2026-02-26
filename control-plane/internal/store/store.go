@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"fmt"
+	"math"
 	"math/rand"
 	"sort"
 	"sync"
@@ -22,15 +24,51 @@ type Store struct {
 	usage  []common.UsageEvent
 	audit  []common.AuditEvent
 	cursor map[string]int
+
+	alertRules  map[string]AlertRule
+	alertEvents []AlertEvent
+	lastAlertAt map[string]time.Time
 }
 
 func New() *Store {
 	return &Store{
-		vendors:  make(map[string]common.Vendor),
-		aliases:  make(map[string]common.ModelAlias),
-		policies: make(map[string]common.RoutingPolicy),
-		cursor:   make(map[string]int),
+		vendors:     make(map[string]common.Vendor),
+		aliases:     make(map[string]common.ModelAlias),
+		policies:    make(map[string]common.RoutingPolicy),
+		cursor:      make(map[string]int),
+		alertRules:  make(map[string]AlertRule),
+		lastAlertAt: make(map[string]time.Time),
 	}
+}
+
+type AlertRule struct {
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	Metric          string    `json:"metric"`
+	Threshold       float64   `json:"threshold"`
+	WindowSeconds   int       `json:"window_seconds"`
+	Severity        string    `json:"severity"`
+	Enabled         bool      `json:"enabled"`
+	WebhookURL      string    `json:"webhook_url,omitempty"`
+	CooldownSeconds int       `json:"cooldown_seconds"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type AlertEvent struct {
+	ID        string    `json:"id"`
+	RuleID    string    `json:"rule_id"`
+	RuleName  string    `json:"rule_name"`
+	Metric    string    `json:"metric"`
+	Value     float64   `json:"value"`
+	Threshold float64   `json:"threshold"`
+	Severity  string    `json:"severity"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type AlertTrigger struct {
+	Event      AlertEvent `json:"event"`
+	WebhookURL string     `json:"-"`
 }
 
 func (s *Store) UpsertVendor(v common.Vendor) common.Vendor {
@@ -156,6 +194,146 @@ func (s *Store) AddAudit(e common.AuditEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.audit = append(s.audit, e)
+}
+
+func (s *Store) UpsertAlertRule(rule AlertRule) AlertRule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !rule.Enabled {
+		rule.Enabled = true
+	}
+	if rule.WindowSeconds <= 0 {
+		rule.WindowSeconds = 300
+	}
+	if rule.Severity == "" {
+		rule.Severity = "warning"
+	}
+	if rule.CooldownSeconds <= 0 {
+		rule.CooldownSeconds = 120
+	}
+	rule.UpdatedAt = time.Now().UTC()
+	s.alertRules[rule.ID] = rule
+	return rule
+}
+
+func (s *Store) ListAlertRules() []AlertRule {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]AlertRule, 0, len(s.alertRules))
+	for _, r := range s.alertRules {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *Store) ListAlertEvents(limit int) []AlertEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > len(s.alertEvents) {
+		limit = len(s.alertEvents)
+	}
+	out := make([]AlertEvent, 0, limit)
+	for i := len(s.alertEvents) - 1; i >= 0 && len(out) < limit; i-- {
+		out = append(out, s.alertEvents[i])
+	}
+	return out
+}
+
+func (s *Store) EvaluateAlerts(now time.Time) []AlertTrigger {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	triggers := make([]AlertTrigger, 0)
+	for _, rule := range s.alertRules {
+		if !rule.Enabled {
+			continue
+		}
+		windowStart := now.Add(-time.Duration(rule.WindowSeconds) * time.Second)
+		window := make([]common.UsageEvent, 0)
+		for _, e := range s.usage {
+			if e.Timestamp.After(windowStart) {
+				window = append(window, e)
+			}
+		}
+		if len(window) == 0 {
+			continue
+		}
+
+		value, ok := evaluateMetric(rule.Metric, window)
+		if !ok || value <= rule.Threshold {
+			continue
+		}
+
+		lastAt := s.lastAlertAt[rule.ID]
+		if !lastAt.IsZero() && now.Sub(lastAt) < time.Duration(rule.CooldownSeconds)*time.Second {
+			continue
+		}
+
+		event := AlertEvent{
+			ID:        fmt.Sprintf("%s-%d", rule.ID, now.UnixNano()),
+			RuleID:    rule.ID,
+			RuleName:  rule.Name,
+			Metric:    rule.Metric,
+			Value:     value,
+			Threshold: rule.Threshold,
+			Severity:  rule.Severity,
+			Message:   fmt.Sprintf("%s triggered: %.2f > %.2f", rule.Metric, value, rule.Threshold),
+			Timestamp: now,
+		}
+		s.alertEvents = append(s.alertEvents, event)
+		if len(s.alertEvents) > 2000 {
+			s.alertEvents = s.alertEvents[len(s.alertEvents)-2000:]
+		}
+		s.lastAlertAt[rule.ID] = now
+		triggers = append(triggers, AlertTrigger{Event: event, WebhookURL: rule.WebhookURL})
+	}
+	return triggers
+}
+
+func evaluateMetric(metric string, usage []common.UsageEvent) (float64, bool) {
+	switch metric {
+	case "error_rate":
+		total := len(usage)
+		if total == 0 {
+			return 0, false
+		}
+		failed := 0
+		for _, e := range usage {
+			if e.Status != "ok" {
+				failed++
+			}
+		}
+		return (float64(failed) / float64(total)) * 100, true
+	case "cost_spike":
+		sum := 0
+		for _, e := range usage {
+			sum += e.CostEstimateCents
+		}
+		return float64(sum), true
+	case "latency_p95":
+		latencies := make([]int64, 0, len(usage))
+		for _, e := range usage {
+			latencies = append(latencies, e.LatencyMs)
+		}
+		if len(latencies) == 0 {
+			return 0, false
+		}
+		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+		idx := int(math.Ceil(float64(len(latencies))*0.95)) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(latencies) {
+			idx = len(latencies) - 1
+		}
+		return float64(latencies[idx]), true
+	default:
+		return 0, false
+	}
 }
 
 func (s *Store) Usage() []common.UsageEvent {
