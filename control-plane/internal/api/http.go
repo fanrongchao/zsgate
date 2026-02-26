@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/costs/by-project", s.handleCostsByProject)
 	mux.HandleFunc("/admin/costs/by-user", s.handleCostsByUser)
 	mux.HandleFunc("/admin/usage/by-user", s.handleUsageByUser)
+	mux.HandleFunc("/admin/usage/by-scenario", s.handleUsageByScenario)
+	mux.HandleFunc("/admin/realtime/active-users", s.handleRealtimeActiveUsers)
+	mux.HandleFunc("/admin/realtime/active-tasks", s.handleRealtimeActiveTasks)
+	mux.HandleFunc("/admin/realtime/stream", s.handleRealtimeStream)
+	mux.HandleFunc("/admin/realtime/dialog-stream", s.handleRealtimeDialogStream)
 	mux.HandleFunc("/internal/events/usage", s.handleUsageEvent)
 	mux.HandleFunc("/internal/events/audit", s.handleAuditEvent)
 	mux.HandleFunc("/internal/routing", s.handleRouting)
@@ -235,6 +241,7 @@ func (s *Server) handleAudits(w http.ResponseWriter, r *http.Request) {
 		"user_id":    r.URL.Query().Get("user_id"),
 		"project_id": r.URL.Query().Get("project_id"),
 		"trace_id":   r.URL.Query().Get("trace_id"),
+		"scenario":   r.URL.Query().Get("scenario"),
 	}
 	writeJSON(w, http.StatusOK, s.store.Audit(filter))
 }
@@ -332,6 +339,286 @@ func (s *Server) handleUsageByUser(w http.ResponseWriter, r *http.Request) {
 		out = append(out, a.userUsageSummary)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+type scenarioUsageSummary struct {
+	ScenarioTag       string `json:"scenario_tag"`
+	Requests          int    `json:"requests"`
+	PromptTokens      int    `json:"prompt_tokens"`
+	CompletionTokens  int    `json:"completion_tokens"`
+	TotalTokens       int    `json:"total_tokens"`
+	CostEstimateCents int    `json:"cost_estimate_cents"`
+	AverageLatencyMs  int64  `json:"average_latency_ms"`
+}
+
+func (s *Server) handleUsageByScenario(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	type agg struct {
+		scenarioUsageSummary
+		latencyTotal int64
+	}
+	data := map[string]*agg{}
+	for _, e := range s.store.Usage() {
+		scenario := e.ScenarioTag
+		if scenario == "" {
+			scenario = "general"
+		}
+		if _, ok := data[scenario]; !ok {
+			data[scenario] = &agg{
+				scenarioUsageSummary: scenarioUsageSummary{
+					ScenarioTag: scenario,
+				},
+			}
+		}
+		a := data[scenario]
+		a.Requests++
+		a.PromptTokens += e.PromptTokens
+		a.CompletionTokens += e.CompletionTokens
+		a.TotalTokens += e.PromptTokens + e.CompletionTokens
+		a.CostEstimateCents += e.CostEstimateCents
+		a.latencyTotal += e.LatencyMs
+	}
+	out := make([]scenarioUsageSummary, 0, len(data))
+	for _, a := range data {
+		if a.Requests > 0 {
+			a.AverageLatencyMs = a.latencyTotal / int64(a.Requests)
+		}
+		out = append(out, a.scenarioUsageSummary)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+type activeUser struct {
+	UserID      string `json:"user_id"`
+	LastSeen    string `json:"last_seen"`
+	Requests1m  int    `json:"requests_1m"`
+	Requests5m  int    `json:"requests_5m"`
+	ProjectID   string `json:"project_id"`
+	ScenarioTag string `json:"scenario_tag"`
+}
+
+func (s *Server) handleRealtimeActiveUsers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	now := time.Now().UTC()
+	usage := s.store.Usage()
+	type agg struct {
+		activeUser
+		lastTime time.Time
+	}
+	users := map[string]*agg{}
+	for _, e := range usage {
+		if now.Sub(e.Timestamp) > 15*time.Minute {
+			continue
+		}
+		if _, ok := users[e.UserID]; !ok {
+			users[e.UserID] = &agg{activeUser: activeUser{UserID: e.UserID}}
+		}
+		u := users[e.UserID]
+		if now.Sub(e.Timestamp) <= 5*time.Minute {
+			u.Requests5m++
+		}
+		if now.Sub(e.Timestamp) <= time.Minute {
+			u.Requests1m++
+		}
+		if e.Timestamp.After(u.lastTime) {
+			u.lastTime = e.Timestamp
+			u.LastSeen = e.Timestamp.Format(time.RFC3339)
+			u.ProjectID = e.ProjectID
+			u.ScenarioTag = e.ScenarioTag
+			if u.ScenarioTag == "" {
+				u.ScenarioTag = "general"
+			}
+		}
+	}
+	out := make([]activeUser, 0, len(users))
+	for _, u := range users {
+		out = append(out, u.activeUser)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen > out[j].LastSeen })
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window":       "15m",
+		"active_users": out,
+		"active_count": len(out),
+	})
+}
+
+type activeTask struct {
+	TaskCategory      string `json:"task_category"`
+	ActiveUsers       int    `json:"active_users"`
+	Requests1m        int    `json:"requests_1m"`
+	Requests5m        int    `json:"requests_5m"`
+	CostEstimateCents int    `json:"cost_estimate_cents_5m"`
+}
+
+func (s *Server) handleRealtimeActiveTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	now := time.Now().UTC()
+	usage := s.store.Usage()
+	type agg struct {
+		activeTask
+		userSet map[string]struct{}
+	}
+	tasks := map[string]*agg{}
+	for _, e := range usage {
+		if now.Sub(e.Timestamp) > 5*time.Minute {
+			continue
+		}
+		task := e.TaskCategory
+		if task == "" {
+			task = e.ScenarioTag
+		}
+		if task == "" {
+			task = "general"
+		}
+		if _, ok := tasks[task]; !ok {
+			tasks[task] = &agg{
+				activeTask: activeTask{TaskCategory: task},
+				userSet:    map[string]struct{}{},
+			}
+		}
+		t := tasks[task]
+		t.Requests5m++
+		if now.Sub(e.Timestamp) <= time.Minute {
+			t.Requests1m++
+		}
+		t.CostEstimateCents += e.CostEstimateCents
+		t.userSet[e.UserID] = struct{}{}
+	}
+	out := make([]activeTask, 0, len(tasks))
+	for _, t := range tasks {
+		t.ActiveUsers = len(t.userSet)
+		out = append(out, t.activeTask)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Requests5m > out[j].Requests5m })
+	writeJSON(w, http.StatusOK, map[string]any{
+		"window":       "5m",
+		"active_tasks": out,
+		"task_count":   len(out),
+	})
+}
+
+func (s *Server) handleRealtimeStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("stream unsupported"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	send := func() {
+		now := time.Now().UTC()
+		usage := s.store.Usage()
+		activeUsers := map[string]struct{}{}
+		tasks := map[string]int{}
+		for _, e := range usage {
+			if now.Sub(e.Timestamp) > 5*time.Minute {
+				continue
+			}
+			activeUsers[e.UserID] = struct{}{}
+			task := e.TaskCategory
+			if task == "" {
+				task = e.ScenarioTag
+			}
+			if task == "" {
+				task = "general"
+			}
+			tasks[task]++
+		}
+		payload := map[string]any{
+			"timestamp":         now.Format(time.RFC3339),
+			"active_user_count": len(activeUsers),
+			"active_task_count": len(tasks),
+			"task_requests_5m":  tasks,
+		}
+		b, _ := json.Marshal(payload)
+		_, _ = fmt.Fprintf(w, "event: snapshot\ndata: %s\n\n", string(b))
+		flusher.Flush()
+	}
+
+	send()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
+func (s *Server) handleRealtimeDialogStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("stream unsupported"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	offset := 0
+	if r.URL.Query().Get("from") == "tail" {
+		_, offset = s.store.AuditSince(0)
+	}
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	sendBatch := func() {
+		events, next := s.store.AuditSince(offset)
+		offset = next
+		for _, e := range events {
+			if e.Action != "chat.completions" && e.Action != "mcp.call" {
+				continue
+			}
+			payload := map[string]any{
+				"timestamp":     e.Timestamp.Format(time.RFC3339),
+				"trace_id":      e.TraceID,
+				"user_id":       e.UserID,
+				"project_id":    e.ProjectID,
+				"scenario_tag":  e.ScenarioTag,
+				"task_category": e.TaskCategory,
+				"action":        e.Action,
+				"request_meta":  e.RequestMeta,
+				"summary":       e.ContentSummary,
+				"retained":      e.ContentRetained,
+			}
+			b, _ := json.Marshal(payload)
+			_, _ = fmt.Fprintf(w, "event: dialog\ndata: %s\n\n", string(b))
+		}
+		flusher.Flush()
+	}
+
+	sendBatch()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			sendBatch()
+		}
+	}
 }
 
 func methodNotAllowed(w http.ResponseWriter) {

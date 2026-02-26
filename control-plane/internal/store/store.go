@@ -180,9 +180,26 @@ func (s *Store) Audit(filter map[string]string) []common.AuditEvent {
 		if filter["trace_id"] != "" && e.TraceID != filter["trace_id"] {
 			continue
 		}
+		if filter["scenario"] != "" && e.ScenarioTag != filter["scenario"] {
+			continue
+		}
 		out = append(out, e)
 	}
 	return out
+}
+
+func (s *Store) AuditSince(offset int) ([]common.AuditEvent, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(s.audit) {
+		offset = len(s.audit)
+	}
+	out := make([]common.AuditEvent, len(s.audit[offset:]))
+	copy(out, s.audit[offset:])
+	return out, len(s.audit)
 }
 
 type RouteTarget struct {

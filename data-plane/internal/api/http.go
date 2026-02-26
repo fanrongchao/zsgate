@@ -5,8 +5,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"zsgate/common"
@@ -86,6 +89,7 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prompt := req.Messages[len(req.Messages)-1].Content
+	ctxMeta = enrichTaskContext(ctxMeta, prompt)
 	start := time.Now()
 	out, err := s.provider.Generate(r.Context(), target.VendorType, target.VendorModel, provider.CompletionRequest{ModelAlias: req.Model, Prompt: prompt})
 	latency := time.Since(start).Milliseconds()
@@ -108,16 +112,23 @@ func (s *Server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cp.EmitUsage(r.Context(), usage)
 
+	retained, redactionLevel, summary := contentRetention(prompt)
+	if summary == "" {
+		summary = fmt.Sprintf("task=%s metadata-only", ctxMeta.TaskCategory)
+	}
+
 	audit := common.AuditEvent{
-		TraceID:        ctxMeta.TraceID,
-		Timestamp:      time.Now().UTC(),
-		Action:         "chat.completions",
-		RequestMeta:    fmt.Sprintf("model=%s provider=%s", req.Model, target.VendorID),
-		ResponseMeta:   fmt.Sprintf("completion_tokens=%d", out.CompletionTokens),
-		ContentHash:    hash(prompt),
-		RedactionLevel: "metadata-only",
-		RiskFlags:      nil,
-		RequestContext: ctxMeta,
+		TraceID:         ctxMeta.TraceID,
+		Timestamp:       time.Now().UTC(),
+		Action:          "chat.completions",
+		RequestMeta:     fmt.Sprintf("model=%s provider=%s task=%s", req.Model, target.VendorID, ctxMeta.TaskCategory),
+		ResponseMeta:    fmt.Sprintf("completion_tokens=%d", out.CompletionTokens),
+		ContentHash:     hash(prompt),
+		RedactionLevel:  redactionLevel,
+		ContentRetained: retained,
+		ContentSummary:  summary,
+		RiskFlags:       nil,
+		RequestContext:  ctxMeta,
 	}
 	s.cp.EmitAudit(r.Context(), audit)
 
@@ -159,6 +170,7 @@ func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("model and input are required"))
 		return
 	}
+	ctxMeta = enrichTaskContext(ctxMeta, req.Input)
 	target, err := s.cp.ResolveRoute(r.Context(), req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
@@ -201,11 +213,12 @@ func (s *Server) mcp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	ctxMeta = enrichTaskContext(ctxMeta, "mcp")
 	s.cp.EmitAudit(r.Context(), common.AuditEvent{
 		TraceID:        ctxMeta.TraceID,
 		Timestamp:      time.Now().UTC(),
 		Action:         "mcp.call",
-		RequestMeta:    "mcp_request",
+		RequestMeta:    fmt.Sprintf("mcp_request task=%s", ctxMeta.TaskCategory),
 		ResponseMeta:   "accepted",
 		ContentHash:    hash("mcp"),
 		RedactionLevel: "metadata-only",
@@ -245,4 +258,73 @@ func controlPlaneURL() string {
 		return v
 	}
 	return "http://localhost:8081"
+}
+
+func enrichTaskContext(ctx common.RequestContext, input string) common.RequestContext {
+	if ctx.ScenarioTag == "" || ctx.ScenarioTag == "general" {
+		ctx.ScenarioTag = classifyTask(input)
+	}
+	ctx.TaskCategory = ctx.ScenarioTag
+	return ctx
+}
+
+func classifyTask(text string) string {
+	v := strings.ToLower(text)
+	switch {
+	case strings.Contains(v, "code"), strings.Contains(v, "bug"), strings.Contains(v, "sql"), strings.Contains(v, "api"), strings.Contains(v, "golang"), strings.Contains(v, "rust"):
+		return "coding"
+	case strings.Contains(v, "translate"), strings.Contains(v, "翻译"), strings.Contains(v, "润色"):
+		return "translation"
+	case strings.Contains(v, "summary"), strings.Contains(v, "总结"), strings.Contains(v, "分析"), strings.Contains(v, "report"):
+		return "analysis"
+	case strings.Contains(v, "runbook"), strings.Contains(v, "运维"), strings.Contains(v, "报警"), strings.Contains(v, "incident"):
+		return "ops"
+	default:
+		return "general"
+	}
+}
+
+func contentRetention(prompt string) (bool, string, string) {
+	mode := strings.ToLower(getEnv("ZS_AUDIT_CONTENT_MODE", "metadata"))
+	switch mode {
+	case "full":
+		return true, "summary-only", truncateForSummary(prompt)
+	case "sampled":
+		sampleRate := parseFloat(getEnv("ZS_AUDIT_SAMPLE_RATE", "0.1"), 0.1)
+		if rand.Float64() <= sampleRate {
+			return true, "summary-only", truncateForSummary(prompt)
+		}
+		return false, "metadata-only", ""
+	default:
+		return false, "metadata-only", ""
+	}
+}
+
+func truncateForSummary(v string) string {
+	v = strings.TrimSpace(v)
+	if len(v) <= 140 {
+		return v
+	}
+	return v[:140] + "..."
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func parseFloat(v string, fallback float64) float64 {
+	out, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	if out < 0 {
+		return 0
+	}
+	if out > 1 {
+		return 1
+	}
+	return out
 }

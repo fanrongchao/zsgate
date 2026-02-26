@@ -19,13 +19,14 @@ const (
 )
 
 type RequestContext struct {
-	TraceID     string `json:"trace_id"`
-	OrgID       string `json:"org_id"`
-	DeptID      string `json:"dept_id"`
-	ProjectID   string `json:"project_id"`
-	UserID      string `json:"user_id"`
-	ClientApp   string `json:"client_app"`
-	ScenarioTag string `json:"scenario_tag"`
+	TraceID      string `json:"trace_id"`
+	OrgID        string `json:"org_id"`
+	DeptID       string `json:"dept_id"`
+	ProjectID    string `json:"project_id"`
+	UserID       string `json:"user_id"`
+	ClientApp    string `json:"client_app"`
+	ScenarioTag  string `json:"scenario_tag"`
+	TaskCategory string `json:"task_category"`
 }
 
 type UsageEvent struct {
@@ -42,14 +43,16 @@ type UsageEvent struct {
 }
 
 type AuditEvent struct {
-	TraceID        string    `json:"trace_id"`
-	Timestamp      time.Time `json:"timestamp"`
-	Action         string    `json:"action"`
-	RequestMeta    string    `json:"request_meta"`
-	ResponseMeta   string    `json:"response_meta"`
-	ContentHash    string    `json:"content_hash"`
-	RedactionLevel string    `json:"redaction_level"`
-	RiskFlags      []string  `json:"risk_flags"`
+	TraceID         string    `json:"trace_id"`
+	Timestamp       time.Time `json:"timestamp"`
+	Action          string    `json:"action"`
+	RequestMeta     string    `json:"request_meta"`
+	ResponseMeta    string    `json:"response_meta"`
+	ContentHash     string    `json:"content_hash"`
+	RedactionLevel  string    `json:"redaction_level"`
+	ContentRetained bool      `json:"content_retained"`
+	ContentSummary  string    `json:"content_summary,omitempty"`
+	RiskFlags       []string  `json:"risk_flags"`
 	RequestContext
 }
 
